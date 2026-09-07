@@ -9,6 +9,14 @@ Deno.test(function internalsExists() {
   assert(!!inspectArgs);
 });
 
+Deno.test(function reloadImportMapExists() {
+  const {
+    reloadImportMap,
+    // @ts-expect-error TypeScript does not support indexing namespaces by symbol
+  } = Deno[Deno.internal];
+  assert(typeof reloadImportMap === "function");
+});
+
 Deno.test(function upgradeHttpRawIsNotExposed() {
   // @ts-expect-error TypeScript does not support indexing namespaces by symbol
   assert(!("upgradeHttpRaw" in Deno[Deno.internal]));
