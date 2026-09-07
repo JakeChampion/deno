@@ -37,23 +37,33 @@ impl<TSys: sys_traits::FsRead> WorkspaceExternalImportMapLoader<TSys> {
   ) -> Result<Option<&ExternalImportMap>, anyhow::Error> {
     self
       .maybe_external_import_map
-      .get_or_try_init(|| {
-        let Some(deno_json) = self.workspace.root_deno_json() else {
-          return Ok(None);
-        };
-        if deno_json.is_an_import_map() {
-          return Ok(None);
-        }
-        let Some(path) = deno_json.to_import_map_path()? else {
-          return Ok(None);
-        };
-        let contents =
-          self.sys.fs_read_to_string(&path).with_context(|| {
-            format!("Unable to read import map at '{}'", path.display())
-          })?;
-        let value = serde_json::from_str(&contents)?;
-        Ok(Some(ExternalImportMap { path, value }))
-      })
+      .get_or_try_init(|| self.load())
       .map(|v| v.as_ref())
+  }
+
+  /// Reads the external import map file referenced by the root deno.json's
+  /// `importMap` entry again, bypassing the cached value from `get_or_load`.
+  /// The cached value is intentionally not updated: it reflects what the
+  /// workspace was created with, while callers of this method are the ones
+  /// swapping the import map at runtime.
+  pub fn load_fresh(&self) -> Result<Option<ExternalImportMap>, anyhow::Error> {
+    self.load()
+  }
+
+  fn load(&self) -> Result<Option<ExternalImportMap>, anyhow::Error> {
+    let Some(deno_json) = self.workspace.root_deno_json() else {
+      return Ok(None);
+    };
+    if deno_json.is_an_import_map() {
+      return Ok(None);
+    }
+    let Some(path) = deno_json.to_import_map_path()? else {
+      return Ok(None);
+    };
+    let contents = self.sys.fs_read_to_string(&path).with_context(|| {
+      format!("Unable to read import map at '{}'", path.display())
+    })?;
+    let value = serde_json::from_str(&contents)?;
+    Ok(Some(ExternalImportMap { path, value }))
   }
 }

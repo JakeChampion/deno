@@ -244,7 +244,7 @@ pub async fn get_import_completions(
                 &module.specifier,
                 text,
                 &range,
-                maybe_import_map,
+                maybe_import_map.as_deref(),
               ) {
                 Some(completion_list) => {
                   // completions for import map specifiers
@@ -320,7 +320,7 @@ pub async fn get_import_completions(
                           })
                           .collect();
                         let mut is_incomplete = false;
-                        if let Some(import_map) = maybe_import_map {
+                        if let Some(import_map) = &maybe_import_map {
                           items.extend(get_base_import_map_completions(
                             import_map,
                             &module.specifier,

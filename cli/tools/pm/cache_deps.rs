@@ -73,6 +73,9 @@ pub async fn cache_top_level_deps(
 
     let mut roots = Vec::new();
 
+    // declared before `info_futures`, which borrows from the entries
+    let maybe_import_map = resolver.maybe_import_map();
+
     let mut info_futures = FuturesUnordered::new();
 
     let mut seen_reqs = HashSet::new();
@@ -88,8 +91,8 @@ pub async fn cache_top_level_deps(
       .collect::<HashMap<_, _>>();
     let workspace_jsr_packages = resolver.jsr_packages();
 
-    let import_map_entries = resolver
-      .maybe_import_map()
+    let import_map_entries = maybe_import_map
+      .as_ref()
       .map(|import_map| {
         import_map
           .imports()

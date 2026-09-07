@@ -738,7 +738,7 @@ impl<TSys: SpecifierUnfurlerSys> SpecifierUnfurler<TSys> {
 
     // check the import map for the types package
     if let Some(import_map) = self.workspace_resolver.maybe_import_map() {
-      let deps = deno_config::import_map::import_map_deps(import_map);
+      let deps = deno_config::import_map::import_map_deps(&import_map);
       for dep in deps {
         if let Some(version_req) = check_dep(dep) {
           return Some(version_req);

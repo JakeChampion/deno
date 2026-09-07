@@ -1443,7 +1443,7 @@ fn diagnose_dependency(
     .get_scoped_resolver(referrer_module.scope.as_deref())
     .as_workspace_resolver()
     .maybe_import_map();
-  if let Some(import_map) = import_map {
+  if let Some(import_map) = &import_map {
     let resolved = dependency
       .maybe_code
       .ok()
@@ -1507,7 +1507,7 @@ fn diagnose_dependency(
     dependency.is_dynamic,
     dependency.maybe_attribute_type.as_deref(),
     referrer_module,
-    import_map,
+    import_map.as_deref(),
   );
   diagnostics.extend(resolution_diagnostics.iter().flat_map(|diag| {
     import_ranges
@@ -1542,7 +1542,7 @@ fn diagnose_dependency(
       dependency.is_dynamic,
       dependency.maybe_attribute_type.as_deref(),
       referrer_module,
-      import_map,
+      import_map.as_deref(),
     );
     diagnostics.extend(
       resolution_diagnostics
