@@ -76,6 +76,7 @@ use deno_runtime::deno_node::ops::require::UnableToGetCwdError;
 use deno_runtime::deno_permissions::CheckSpecifierKind;
 use deno_runtime::deno_permissions::PermissionsContainer;
 use deno_runtime::deno_web::Blob;
+use deno_runtime::ops::runtime::ImportMapReloader;
 use deno_runtime::tokio_util::create_basic_runtime;
 use deno_semver::npm::NpmPackageReqReference;
 use deno_semver::package::PackageReq;
@@ -98,6 +99,7 @@ use crate::args::DenoSubcommand;
 use crate::args::TsTypeLib;
 use crate::args::jsr_url;
 use crate::cache::CodeCache;
+use crate::factory::CliResolverFactory;
 use crate::file_fetcher::CliFileFetcher;
 use crate::graph_container::MainModuleGraphContainer;
 use crate::graph_container::ModuleGraphContainer;
@@ -375,6 +377,7 @@ struct SharedCliModuleLoaderState {
   parsed_source_cache: Arc<ParsedSourceCache>,
   module_loader: Arc<CliDenoResolverModuleLoader>,
   resolver: Arc<CliResolver>,
+  resolver_factory: Arc<CliResolverFactory>,
   sys: CliSys,
   in_flight_loads_tracker: InFlightModuleLoadsTracker,
   maybe_eszip_loader: Option<Arc<EszipModuleLoader>>,
@@ -440,6 +443,7 @@ impl CliModuleLoaderFactory {
     parsed_source_cache: Arc<ParsedSourceCache>,
     module_loader: Arc<CliDenoResolverModuleLoader>,
     resolver: Arc<CliResolver>,
+    resolver_factory: Arc<CliResolverFactory>,
     sys: CliSys,
     maybe_eszip_loader: Option<Arc<EszipModuleLoader>>,
     watcher_communicator: Option<Arc<WatcherCommunicator>>,
@@ -469,6 +473,7 @@ impl CliModuleLoaderFactory {
         parsed_source_cache,
         module_loader,
         resolver,
+        resolver_factory,
         sys,
         in_flight_loads_tracker: InFlightModuleLoadsTracker {
           loads_number: Arc::new(AtomicU16::new(0)),
@@ -548,11 +553,58 @@ impl CliModuleLoaderFactory {
         .npm_registry_permission_checker
         .clone(),
     });
+    let import_map_reloader = Rc::new(CliImportMapReloader {
+      inner: module_loader.0.clone(),
+    });
     CreateModuleLoaderResult {
       module_loader,
       node_require_loader,
       hook_registry: Some(hook_registry),
+      import_map_reloader: Some(import_map_reloader),
     }
+  }
+}
+
+/// Backs `Deno[Deno.internal].reloadImportMap()` for one isolate.
+///
+/// Reloading has two halves. The import map itself is shared by the whole
+/// process (one `WorkspaceResolver` behind the `CliResolver`), so re-reading
+/// it through the resolver factory swaps it for every isolate at once. The
+/// resolutions already computed against the old map live in each isolate's
+/// module graph, so only the calling isolate's graph is reset here; other
+/// workers keep their cached edges until they call the method themselves.
+///
+/// Modules already instantiated in V8 keep their import edges regardless;
+/// the new map only affects resolutions that have not happened yet (dynamic
+/// imports of not-yet-imported specifiers, `import.meta.resolve()`, and new
+/// worker entry modules).
+struct CliImportMapReloader<TGraphContainer: ModuleGraphContainer> {
+  inner: Rc<CliModuleLoaderInner<TGraphContainer>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl<TGraphContainer: ModuleGraphContainer> ImportMapReloader
+  for CliImportMapReloader<TGraphContainer>
+{
+  async fn reload(&self) -> Result<(), JsErrorBox> {
+    let inner = &self.inner;
+    inner
+      .shared
+      .resolver_factory
+      .reload_import_map()
+      .await
+      .map_err(|err| JsErrorBox::generic(format!("{err:#}")))?;
+    // Hold the update permit while replacing the graph so an in-flight
+    // `prepare_module_load` cannot commit its clone of the old graph over
+    // the reset. Starting from an empty graph also leaves `roots` empty,
+    // which makes the next dynamic import take the full prepare path rather
+    // than the "already in graph, skip prepare" shortcut.
+    let mut permit = inner.graph_container.acquire_update_permit().await;
+    *permit.graph_mut() = ModuleGraph::new(inner.shared.graph_kind);
+    permit.commit();
+    // mtime-based reload decisions for dynamic imports start over too
+    inner.loaded_files.borrow_mut().clear();
+    Ok(())
   }
 }
 
