@@ -1,0 +1,6 @@
+main before: a
+worker1 before: a
+main after: b
+worker1 after: a
+worker1 reloaded: b
+worker2: b

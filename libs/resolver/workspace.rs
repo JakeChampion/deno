@@ -326,6 +326,16 @@ impl<TSys: FsMetadata> CachedMetadataFs<TSys> {
     }
   }
 
+  fn sys(&self) -> &TSys {
+    &self.sys
+  }
+
+  fn clear_cache(&self) {
+    if let Some(cache) = &self.cache {
+      cache.clear();
+    }
+  }
+
   fn stat_sync(&self, path: &Path) -> Option<CachedMetadataFsEntry> {
     if let Some(cache) = &self.cache
       && let Some(entry) = cache.get(path)
@@ -821,7 +831,7 @@ impl From<NodeResolutionKind> for ResolutionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceResolverDiagnostic<'a> {
-  ImportMap(&'a ImportMapDiagnostic),
+  ImportMap(ImportMapDiagnostic),
   CompilerOptionsRootDirs(&'a CompilerOptionsRootDirsDiagnostic),
 }
 
@@ -838,11 +848,34 @@ impl fmt::Display for WorkspaceResolverDiagnostic<'_> {
 type CompilerOptionsResolverCellRc =
   deno_maybe_sync::MaybeArc<RwLock<CompilerOptionsResolverRc>>;
 
+#[allow(clippy::disallowed_types, reason = "definition")]
+pub type ImportMapRc = deno_maybe_sync::MaybeArc<ImportMap>;
+
+/// The import map currently in use by a `WorkspaceResolver` along with the
+/// diagnostics produced when it was parsed.
+#[derive(Debug)]
+struct WorkspaceImportMap {
+  import_map: ImportMapRc,
+  diagnostics: Vec<ImportMapDiagnostic>,
+}
+
+impl From<ImportMapWithDiagnostics> for WorkspaceImportMap {
+  fn from(value: ImportMapWithDiagnostics) -> Self {
+    Self {
+      import_map: new_rc(value.import_map),
+      diagnostics: value.diagnostics,
+    }
+  }
+}
+
 #[derive(Debug)]
 pub struct WorkspaceResolver<TSys: FsMetadata + FsRead> {
   workspace_root: UrlRc,
   jsr_pkgs: Vec<ResolverWorkspaceJsrPackage>,
-  maybe_import_map: Option<ImportMapWithDiagnostics>,
+  /// Behind a lock so the import map can be swapped at runtime (see
+  /// `set_import_map` / `reload_import_map`) while every holder of an
+  /// `Arc<WorkspaceResolver>` keeps working through `&self`.
+  import_map: RwLock<Option<WorkspaceImportMap>>,
   pkg_jsons: FolderScopedMap<PkgJsonResolverFolderConfig>,
   pkg_json_dep_resolution: PackageJsonDepResolution,
   sloppy_imports_options: SloppyImportsOptions,
@@ -852,275 +885,283 @@ pub struct WorkspaceResolver<TSys: FsMetadata + FsRead> {
   catalogs: IndexMap<String, IndexMap<String, String>>,
 }
 
+/// Builds the workspace's synthetic import map from the optionally specified
+/// import map and the workspace's deno.json files. This is the single
+/// derivation used both when constructing a `WorkspaceResolver` and when
+/// reloading its import map at runtime.
+///
+/// `fresh_root_deno_json`, when provided, is used in place of the workspace's
+/// cached root deno.json so that changes made to that file after the workspace
+/// was discovered (its inline `imports`/`scopes` or its `importMap` path) are
+/// reflected. The rest of the workspace is used as-is.
+fn build_import_map(
+  sys: &impl FsRead,
+  workspace: &Workspace,
+  specified_import_map: Option<SpecifiedImportMap>,
+  fresh_root_deno_json: Option<ConfigFileRc>,
+) -> Result<Option<ImportMapWithDiagnostics>, WorkspaceResolverCreateError> {
+  // Replaces `catalog:`/`catalog:<name>` string values in an import map
+  // value's `imports` and `scopes` with the `npm:<name>@<version_req>`
+  // specifier from the workspace root's catalog, so everything downstream
+  // (resolution, installation, the lockfile) sees a regular npm specifier.
+  // A trailing slash entry is added for "directory" imports, mirroring the
+  // expansion `to_import_map_value` applies to inline `npm:` specifiers.
+  fn expand_catalog_specifiers(
+    value: serde_json::Value,
+    catalogs: &IndexMap<String, IndexMap<String, String>>,
+  ) -> Result<serde_json::Value, WorkspaceResolverCreateError> {
+    fn expand_entries(
+      obj: serde_json::Map<String, serde_json::Value>,
+      catalogs: &IndexMap<String, IndexMap<String, String>>,
+    ) -> Result<
+      serde_json::Map<String, serde_json::Value>,
+      WorkspaceResolverCreateError,
+    > {
+      let mut result = serde_json::Map::with_capacity(obj.len());
+      for (key, value) in &obj {
+        let maybe_catalog_name =
+          value.as_str().and_then(|s| s.strip_prefix("catalog:"));
+        let Some(catalog_name) = maybe_catalog_name else {
+          result.insert(key.clone(), value.clone());
+          continue;
+        };
+        let catalog_name = if catalog_name.is_empty() {
+          "default"
+        } else {
+          catalog_name
+        };
+        let name = key.strip_suffix('/').unwrap_or(key);
+        let version_req = catalogs
+          .get(catalog_name)
+          .and_then(|catalog| catalog.get(name))
+          .ok_or_else(|| {
+            WorkspaceResolverCreateError::CatalogPackageNotFound {
+              name: name.to_string(),
+            }
+          })?;
+        if key.ends_with('/') {
+          result.insert(
+            key.clone(),
+            format!("npm:/{}@{}/", name, version_req).into(),
+          );
+        } else {
+          result.insert(
+            key.clone(),
+            format!("npm:{}@{}", name, version_req).into(),
+          );
+          let key_with_slash = format!("{}/", key);
+          if !obj.contains_key(&key_with_slash) {
+            result.insert(
+              key_with_slash,
+              format!("npm:/{}@{}/", name, version_req).into(),
+            );
+          }
+        }
+      }
+      Ok(result)
+    }
+
+    let serde_json::Value::Object(mut map) = value else {
+      return Ok(value);
+    };
+    if let Some(serde_json::Value::Object(imports)) = map.remove("imports") {
+      map.insert(
+        "imports".to_string(),
+        expand_entries(imports, catalogs)?.into(),
+      );
+    }
+    if let Some(serde_json::Value::Object(scopes)) = map.remove("scopes") {
+      let mut expanded_scopes = serde_json::Map::with_capacity(scopes.len());
+      for (scope_key, scope_value) in scopes {
+        let scope_value = match scope_value {
+          serde_json::Value::Object(obj) => {
+            expand_entries(obj, catalogs)?.into()
+          }
+          _ => scope_value,
+        };
+        expanded_scopes.insert(scope_key, scope_value);
+      }
+      map.insert("scopes".to_string(), expanded_scopes.into());
+    }
+    Ok(serde_json::Value::Object(map))
+  }
+
+  // Builds the import map scope contributed by a workspace member or linked
+  // package. The member's `imports` (not its `scopes`) are layered into the
+  // synthetic map; this follows an external `importMap` file when the
+  // member uses one. `to_import_map_value` already applies Deno's bare
+  // specifier expansion for inline maps and leaves external maps untouched,
+  // matching the import map standard, so no extra expansion is done here.
+  fn child_import_map_config(
+    sys: &impl FsRead,
+    config: &ConfigFileRc,
+    catalogs: &IndexMap<String, IndexMap<String, String>>,
+  ) -> Result<import_map::ext::ImportMapConfig, WorkspaceResolverCreateError>
+  {
+    let (base_url, value) = match config.to_import_map_value(sys) {
+      Ok(Some((specifier, value))) => (specifier.into_owned(), value),
+      Ok(None) => (
+        config.specifier.clone(),
+        serde_json::Value::Object(Default::default()),
+      ),
+      Err(err) => {
+        log::debug!("Ignoring import map for {}: {:#}", config.specifier, err);
+        (
+          config.specifier.clone(),
+          serde_json::Value::Object(Default::default()),
+        )
+      }
+    };
+    let mut imports_only = serde_json::Map::with_capacity(1);
+    if let serde_json::Value::Object(mut obj) = value
+      && let Some(imports) = obj.remove("imports")
+    {
+      imports_only.insert("imports".to_string(), imports);
+    }
+    // catalog expansion only applies to inline imports, not to
+    // external import map files
+    let import_map_value = if config.is_an_import_map() {
+      expand_catalog_specifiers(imports_only.into(), catalogs)?
+    } else {
+      imports_only.into()
+    };
+    Ok(import_map::ext::ImportMapConfig {
+      base_url,
+      import_map_value,
+    })
+  }
+
+  let root_deno_json = fresh_root_deno_json
+    .as_ref()
+    .or_else(|| workspace.root_deno_json());
+  let deno_jsons = workspace
+    .resolver_deno_jsons()
+    .map(|config| match &fresh_root_deno_json {
+      Some(fresh) if fresh.specifier == config.specifier => fresh,
+      _ => config,
+    })
+    .collect::<Vec<_>>();
+
+  // The base of the synthetic import map: either an explicitly specified map
+  // (the `--import-map` flag or the root's external `importMap` file) or the
+  // root deno.json's own import map. Either way, workspace member and linked
+  // package scopes are layered on top so their bare specifiers resolve.
+  let base_import_map_config = match specified_import_map {
+    Some(SpecifiedImportMap { base_url, value }) => {
+      import_map::ext::ImportMapConfig {
+        base_url,
+        import_map_value: value,
+      }
+    }
+    None => {
+      if !deno_jsons.iter().any(|p| p.is_package())
+        && !deno_jsons.iter().any(|c| {
+          c.json.import_map.is_some()
+            || c.json.scopes.is_some()
+            || c.json.imports.is_some()
+            || c
+              .json
+              .compiler_options
+              .as_ref()
+              .and_then(|v| v.as_object()?.get("rootDirs")?.as_array())
+              .is_some_and(|a| a.len() > 1)
+        })
+      {
+        // no configs have an import map and none are a package, so exit
+        return Ok(None);
+      }
+
+      let (base_url, value) = match root_deno_json.as_ref() {
+        Some(deno_json) => deno_json
+          .to_import_map_value(sys)
+          .map_err(|source| WorkspaceResolverCreateError::ImportMapFetch {
+            referrer: deno_json.specifier.clone(),
+            source: Box::new(source),
+          })?
+          .map(|(specifier, value)| (specifier.into_owned(), value))
+          .unwrap_or_else(|| {
+            (
+              deno_json.specifier.clone(),
+              serde_json::Value::Object(Default::default()),
+            )
+          }),
+        None => (
+          workspace.root_dir_url().join("deno.json").unwrap(),
+          serde_json::Value::Object(Default::default()),
+        ),
+      };
+      // catalog expansion only applies to inline imports, not to
+      // external import map files
+      let value = if root_deno_json
+        .as_ref()
+        .is_some_and(|d| d.is_an_import_map())
+      {
+        expand_catalog_specifiers(value, workspace.catalogs())?
+      } else {
+        value
+      };
+      import_map::ext::ImportMapConfig {
+        base_url,
+        import_map_value: value,
+      }
+    }
+  };
+
+  let child_import_map_configs = deno_jsons
+    .iter()
+    .filter(|f| {
+      Some(&f.specifier) != root_deno_json.as_ref().map(|c| &c.specifier)
+    })
+    .map(|config| child_import_map_config(sys, config, workspace.catalogs()))
+    .collect::<Result<Vec<_>, _>>()?;
+  let (import_map_url, mut import_map) =
+    ::import_map::ext::create_synthetic_import_map(
+      base_import_map_config,
+      child_import_map_configs,
+    );
+  // When `jsrDepsInNodeModules` is enabled, install and resolve `jsr:`
+  // dependencies through the npm machinery by rewriting them to their
+  // npm-compat (`@jsr/scope__name`) form. This mirrors how pnpm/npm install
+  // JSR packages and ensures they end up in `node_modules` (so external
+  // tooling can find them) and resolve from disk (so `import.meta.dirname`
+  // and bundled assets work). The local npm installer additionally writes a
+  // `@jsr:registry` entry to `.npmrc` so that external tooling can resolve
+  // the materialized packages.
+  //
+  // The rewrite is only meaningful when a `node_modules` directory is
+  // actually in use: that is what materializes the packages, writes the
+  // alias symlinks, and writes the `.npmrc`. Without it the rewrite would
+  // resolve `jsr:` deps from the global npm cache with none of that, which
+  // contradicts the option's "requires a `node_modules` directory" meaning.
+  // So we couple the two and skip the rewrite when no `node_modules`
+  // directory is enabled.
+  let uses_node_modules_dir =
+    match workspace.node_modules_dir().unwrap_or_default() {
+      Some(mode) => mode.uses_node_modules_dir(),
+      None => workspace.root_pkg_json().is_some(),
+    };
+  if workspace.jsr_deps_in_node_modules() == Some(true) && uses_node_modules_dir
+  {
+    deno_config::import_map::rewrite_jsr_imports_to_npm(&mut import_map);
+  }
+  log::debug!(
+    "Workspace config generated this import map {}",
+    serde_json::to_string_pretty(&import_map).unwrap()
+  );
+  Ok(Some(import_map::parse_from_value(
+    import_map_url,
+    import_map,
+  )?))
+}
+
 impl<TSys: FsMetadata + FsRead> WorkspaceResolver<TSys> {
   pub fn from_workspace(
     workspace: &Workspace,
     sys: TSys,
     options: CreateResolverOptions,
   ) -> Result<Self, WorkspaceResolverCreateError> {
-    fn resolve_import_map(
-      sys: &impl FsRead,
-      workspace: &Workspace,
-      specified_import_map: Option<SpecifiedImportMap>,
-    ) -> Result<Option<ImportMapWithDiagnostics>, WorkspaceResolverCreateError>
-    {
-      // Replaces `catalog:`/`catalog:<name>` string values in an import map
-      // value's `imports` and `scopes` with the `npm:<name>@<version_req>`
-      // specifier from the workspace root's catalog, so everything downstream
-      // (resolution, installation, the lockfile) sees a regular npm specifier.
-      // A trailing slash entry is added for "directory" imports, mirroring the
-      // expansion `to_import_map_value` applies to inline `npm:` specifiers.
-      fn expand_catalog_specifiers(
-        value: serde_json::Value,
-        catalogs: &IndexMap<String, IndexMap<String, String>>,
-      ) -> Result<serde_json::Value, WorkspaceResolverCreateError> {
-        fn expand_entries(
-          obj: serde_json::Map<String, serde_json::Value>,
-          catalogs: &IndexMap<String, IndexMap<String, String>>,
-        ) -> Result<
-          serde_json::Map<String, serde_json::Value>,
-          WorkspaceResolverCreateError,
-        > {
-          let mut result = serde_json::Map::with_capacity(obj.len());
-          for (key, value) in &obj {
-            let maybe_catalog_name =
-              value.as_str().and_then(|s| s.strip_prefix("catalog:"));
-            let Some(catalog_name) = maybe_catalog_name else {
-              result.insert(key.clone(), value.clone());
-              continue;
-            };
-            let catalog_name = if catalog_name.is_empty() {
-              "default"
-            } else {
-              catalog_name
-            };
-            let name = key.strip_suffix('/').unwrap_or(key);
-            let version_req = catalogs
-              .get(catalog_name)
-              .and_then(|catalog| catalog.get(name))
-              .ok_or_else(|| {
-                WorkspaceResolverCreateError::CatalogPackageNotFound {
-                  name: name.to_string(),
-                }
-              })?;
-            if key.ends_with('/') {
-              result.insert(
-                key.clone(),
-                format!("npm:/{}@{}/", name, version_req).into(),
-              );
-            } else {
-              result.insert(
-                key.clone(),
-                format!("npm:{}@{}", name, version_req).into(),
-              );
-              let key_with_slash = format!("{}/", key);
-              if !obj.contains_key(&key_with_slash) {
-                result.insert(
-                  key_with_slash,
-                  format!("npm:/{}@{}/", name, version_req).into(),
-                );
-              }
-            }
-          }
-          Ok(result)
-        }
-
-        let serde_json::Value::Object(mut map) = value else {
-          return Ok(value);
-        };
-        if let Some(serde_json::Value::Object(imports)) = map.remove("imports")
-        {
-          map.insert(
-            "imports".to_string(),
-            expand_entries(imports, catalogs)?.into(),
-          );
-        }
-        if let Some(serde_json::Value::Object(scopes)) = map.remove("scopes") {
-          let mut expanded_scopes =
-            serde_json::Map::with_capacity(scopes.len());
-          for (scope_key, scope_value) in scopes {
-            let scope_value = match scope_value {
-              serde_json::Value::Object(obj) => {
-                expand_entries(obj, catalogs)?.into()
-              }
-              _ => scope_value,
-            };
-            expanded_scopes.insert(scope_key, scope_value);
-          }
-          map.insert("scopes".to_string(), expanded_scopes.into());
-        }
-        Ok(serde_json::Value::Object(map))
-      }
-
-      // Builds the import map scope contributed by a workspace member or linked
-      // package. The member's `imports` (not its `scopes`) are layered into the
-      // synthetic map; this follows an external `importMap` file when the
-      // member uses one. `to_import_map_value` already applies Deno's bare
-      // specifier expansion for inline maps and leaves external maps untouched,
-      // matching the import map standard, so no extra expansion is done here.
-      fn child_import_map_config(
-        sys: &impl FsRead,
-        config: &ConfigFileRc,
-        catalogs: &IndexMap<String, IndexMap<String, String>>,
-      ) -> Result<import_map::ext::ImportMapConfig, WorkspaceResolverCreateError>
-      {
-        let (base_url, value) = match config.to_import_map_value(sys) {
-          Ok(Some((specifier, value))) => (specifier.into_owned(), value),
-          Ok(None) => (
-            config.specifier.clone(),
-            serde_json::Value::Object(Default::default()),
-          ),
-          Err(err) => {
-            log::debug!(
-              "Ignoring import map for {}: {:#}",
-              config.specifier,
-              err
-            );
-            (
-              config.specifier.clone(),
-              serde_json::Value::Object(Default::default()),
-            )
-          }
-        };
-        let mut imports_only = serde_json::Map::with_capacity(1);
-        if let serde_json::Value::Object(mut obj) = value
-          && let Some(imports) = obj.remove("imports")
-        {
-          imports_only.insert("imports".to_string(), imports);
-        }
-        // catalog expansion only applies to inline imports, not to
-        // external import map files
-        let import_map_value = if config.is_an_import_map() {
-          expand_catalog_specifiers(imports_only.into(), catalogs)?
-        } else {
-          imports_only.into()
-        };
-        Ok(import_map::ext::ImportMapConfig {
-          base_url,
-          import_map_value,
-        })
-      }
-
-      let root_deno_json = workspace.root_deno_json();
-      let deno_jsons = workspace.resolver_deno_jsons().collect::<Vec<_>>();
-
-      // The base of the synthetic import map: either an explicitly specified map
-      // (the `--import-map` flag or the root's external `importMap` file) or the
-      // root deno.json's own import map. Either way, workspace member and linked
-      // package scopes are layered on top so their bare specifiers resolve.
-      let base_import_map_config = match specified_import_map {
-        Some(SpecifiedImportMap { base_url, value }) => {
-          import_map::ext::ImportMapConfig {
-            base_url,
-            import_map_value: value,
-          }
-        }
-        None => {
-          if !deno_jsons.iter().any(|p| p.is_package())
-            && !deno_jsons.iter().any(|c| {
-              c.json.import_map.is_some()
-                || c.json.scopes.is_some()
-                || c.json.imports.is_some()
-                || c
-                  .json
-                  .compiler_options
-                  .as_ref()
-                  .and_then(|v| v.as_object()?.get("rootDirs")?.as_array())
-                  .is_some_and(|a| a.len() > 1)
-            })
-          {
-            // no configs have an import map and none are a package, so exit
-            return Ok(None);
-          }
-
-          let (base_url, value) = match root_deno_json.as_ref() {
-            Some(deno_json) => deno_json
-              .to_import_map_value(sys)
-              .map_err(|source| WorkspaceResolverCreateError::ImportMapFetch {
-                referrer: deno_json.specifier.clone(),
-                source: Box::new(source),
-              })?
-              .map(|(specifier, value)| (specifier.into_owned(), value))
-              .unwrap_or_else(|| {
-                (
-                  deno_json.specifier.clone(),
-                  serde_json::Value::Object(Default::default()),
-                )
-              }),
-            None => (
-              workspace.root_dir_url().join("deno.json").unwrap(),
-              serde_json::Value::Object(Default::default()),
-            ),
-          };
-          // catalog expansion only applies to inline imports, not to
-          // external import map files
-          let value = if root_deno_json
-            .as_ref()
-            .is_some_and(|d| d.is_an_import_map())
-          {
-            expand_catalog_specifiers(value, workspace.catalogs())?
-          } else {
-            value
-          };
-          import_map::ext::ImportMapConfig {
-            base_url,
-            import_map_value: value,
-          }
-        }
-      };
-
-      let child_import_map_configs = deno_jsons
-        .iter()
-        .filter(|f| {
-          Some(&f.specifier) != root_deno_json.as_ref().map(|c| &c.specifier)
-        })
-        .map(|config| {
-          child_import_map_config(sys, config, workspace.catalogs())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-      let (import_map_url, mut import_map) =
-        ::import_map::ext::create_synthetic_import_map(
-          base_import_map_config,
-          child_import_map_configs,
-        );
-      // When `jsrDepsInNodeModules` is enabled, install and resolve `jsr:`
-      // dependencies through the npm machinery by rewriting them to their
-      // npm-compat (`@jsr/scope__name`) form. This mirrors how pnpm/npm install
-      // JSR packages and ensures they end up in `node_modules` (so external
-      // tooling can find them) and resolve from disk (so `import.meta.dirname`
-      // and bundled assets work). The local npm installer additionally writes a
-      // `@jsr:registry` entry to `.npmrc` so that external tooling can resolve
-      // the materialized packages.
-      //
-      // The rewrite is only meaningful when a `node_modules` directory is
-      // actually in use: that is what materializes the packages, writes the
-      // alias symlinks, and writes the `.npmrc`. Without it the rewrite would
-      // resolve `jsr:` deps from the global npm cache with none of that, which
-      // contradicts the option's "requires a `node_modules` directory" meaning.
-      // So we couple the two and skip the rewrite when no `node_modules`
-      // directory is enabled.
-      let uses_node_modules_dir =
-        match workspace.node_modules_dir().unwrap_or_default() {
-          Some(mode) => mode.uses_node_modules_dir(),
-          None => workspace.root_pkg_json().is_some(),
-        };
-      if workspace.jsr_deps_in_node_modules() == Some(true)
-        && uses_node_modules_dir
-      {
-        deno_config::import_map::rewrite_jsr_imports_to_npm(&mut import_map);
-      }
-      log::debug!(
-        "Workspace config generated this import map {}",
-        serde_json::to_string_pretty(&import_map).unwrap()
-      );
-      Ok(Some(import_map::parse_from_value(
-        import_map_url,
-        import_map,
-      )?))
-    }
-
     let maybe_import_map =
-      resolve_import_map(&sys, workspace, options.specified_import_map)?;
+      build_import_map(&sys, workspace, options.specified_import_map, None)?;
     let jsr_pkgs = workspace.resolver_jsr_pkgs().collect::<Vec<_>>();
     let pkg_jsons = workspace
       .resolver_pkg_jsons()
@@ -1148,7 +1189,7 @@ impl<TSys: FsMetadata + FsRead> WorkspaceResolver<TSys> {
       workspace_root: workspace.root_dir_url().clone(),
       pkg_json_dep_resolution: options.pkg_json_dep_resolution,
       jsr_pkgs,
-      maybe_import_map,
+      import_map: RwLock::new(maybe_import_map.map(WorkspaceImportMap::from)),
       pkg_jsons: FolderScopedMap::from_map(pkg_jsons),
       sloppy_imports_options: options.sloppy_imports_options,
       fs_cache_options: options.fs_cache_options,
@@ -1173,11 +1214,11 @@ impl<TSys: FsMetadata + FsRead> WorkspaceResolver<TSys> {
     sys: TSys,
     catalogs: IndexMap<String, IndexMap<String, String>>,
   ) -> Self {
-    let maybe_import_map =
-      maybe_import_map.map(|import_map| ImportMapWithDiagnostics {
-        import_map,
+    let import_map =
+      RwLock::new(maybe_import_map.map(|import_map| WorkspaceImportMap {
+        import_map: new_rc(import_map),
         diagnostics: Default::default(),
-      });
+      }));
     let pkg_jsons = pkg_jsons
       .into_iter()
       .map(|pkg_json| {
@@ -1203,7 +1244,7 @@ impl<TSys: FsMetadata + FsRead> WorkspaceResolver<TSys> {
     Self {
       workspace_root,
       jsr_pkgs,
-      maybe_import_map,
+      import_map,
       pkg_jsons: FolderScopedMap::from_map(pkg_jsons),
       pkg_json_dep_resolution,
       sloppy_imports_options,
@@ -1227,7 +1268,11 @@ impl<TSys: FsMetadata + FsRead> WorkspaceResolver<TSys> {
     SerializableWorkspaceResolver {
       import_map: self.maybe_import_map().map(|i| {
         SerializedWorkspaceResolverImportMap {
-          specifier: root_dir_url.make_relative_if_descendant(i.base_url()),
+          specifier: Cow::Owned(
+            root_dir_url
+              .make_relative_if_descendant(i.base_url())
+              .into_owned(),
+          ),
           json: Cow::Owned(i.to_json()),
         }
       }),
@@ -1329,8 +1374,46 @@ impl<TSys: FsMetadata + FsRead> WorkspaceResolver<TSys> {
     *self.compiler_options_resolver.write() = value;
   }
 
-  pub fn maybe_import_map(&self) -> Option<&ImportMap> {
-    self.maybe_import_map.as_ref().map(|c| &c.import_map)
+  pub fn maybe_import_map(&self) -> Option<ImportMapRc> {
+    self
+      .import_map
+      .read()
+      .as_ref()
+      .map(|c| c.import_map.clone())
+  }
+
+  /// Replaces the import map used for resolution. Cached file system probes
+  /// used by sloppy imports are cleared so mappings pointing at newly written
+  /// files are found.
+  ///
+  /// Note that resolutions already cached in a module graph or instantiated
+  /// in V8 are not affected; callers are responsible for invalidating those.
+  pub fn set_import_map(&self, value: Option<ImportMapWithDiagnostics>) {
+    *self.import_map.write() = value.map(WorkspaceImportMap::from);
+    self.sloppy_imports_resolver.fs.clear_cache();
+  }
+
+  /// Rebuilds the import map from the workspace and the optionally specified
+  /// import map using the same derivation as `from_workspace`, then swaps it
+  /// in. On error the current import map is left unchanged.
+  ///
+  /// Pass a freshly read root deno.json as `fresh_root_deno_json` to pick up
+  /// changes to its inline `imports`/`scopes` or `importMap` path; the
+  /// workspace itself is not re-discovered.
+  pub fn reload_import_map(
+    &self,
+    workspace: &Workspace,
+    specified_import_map: Option<SpecifiedImportMap>,
+    fresh_root_deno_json: Option<ConfigFileRc>,
+  ) -> Result<(), WorkspaceResolverCreateError> {
+    let import_map = build_import_map(
+      self.sloppy_imports_resolver.fs.sys(),
+      workspace,
+      specified_import_map,
+      fresh_root_deno_json,
+    )?;
+    self.set_import_map(import_map);
+    Ok(())
   }
 
   pub fn package_jsons(&self) -> impl Iterator<Item = &PackageJsonRc> {
@@ -1343,10 +1426,11 @@ impl<TSys: FsMetadata + FsRead> WorkspaceResolver<TSys> {
 
   pub fn diagnostics(&self) -> Vec<WorkspaceResolverDiagnostic<'_>> {
     self
-      .maybe_import_map
+      .import_map
+      .read()
       .as_ref()
-      .iter()
-      .flat_map(|c| &c.diagnostics)
+      .into_iter()
+      .flat_map(|c| c.diagnostics.iter().cloned())
       .map(WorkspaceResolverDiagnostic::ImportMap)
       .collect()
   }
@@ -1363,10 +1447,10 @@ impl<TSys: FsMetadata + FsRead> WorkspaceResolver<TSys> {
       compiler_options_resolver.for_specifier(referrer);
     let compiler_options_paths = compiler_options_data.paths();
     let mut used_import_map = false;
-    let resolve_result = if let Some(import_map) = &self.maybe_import_map {
+    let maybe_import_map = self.maybe_import_map();
+    let resolve_result = if let Some(import_map) = &maybe_import_map {
       used_import_map = true;
       import_map
-        .import_map
         .resolve(specifier, referrer)
         .map_err(MappedResolutionError::ImportMap)
     } else {
@@ -3342,6 +3426,176 @@ mod test {
     {
       MappedResolution::Normal { specifier, .. } => {
         assert_eq!(specifier, root.join("b/mod.ts").unwrap());
+      }
+      _ => unreachable!(),
+    }
+  }
+
+  #[test]
+  fn reload_import_map_swaps_resolution() {
+    let sys = InMemorySys::default();
+    sys.fs_insert_json(root_dir().join("deno.json"), json!({}));
+    let workspace_dir = workspace_at_start_dir(&sys, &root_dir());
+    let root = url_from_directory_path(&root_dir()).unwrap();
+    let specified = |target: &str| SpecifiedImportMap {
+      base_url: root.clone(),
+      value: json!({ "imports": { "alias": target } }),
+    };
+    let resolver = WorkspaceResolver::from_workspace(
+      &workspace_dir.workspace,
+      sys,
+      super::CreateResolverOptions {
+        pkg_json_dep_resolution: PackageJsonDepResolution::Enabled,
+        specified_import_map: Some(specified("./a.ts")),
+        sloppy_imports_options: SloppyImportsOptions::Unspecified,
+        fs_cache_options: FsCacheOptions::Enabled,
+      },
+    )
+    .unwrap();
+    let referrer = root.join("main.ts").unwrap();
+    let resolve_alias =
+      |resolver: &WorkspaceResolver<InMemorySys>| match resolver
+        .resolve("alias", &referrer, ResolutionKind::Execution)
+        .unwrap()
+      {
+        MappedResolution::Normal { specifier, .. } => specifier,
+        _ => unreachable!(),
+      };
+    assert_eq!(resolve_alias(&resolver), root.join("a.ts").unwrap());
+    // the import map handed out before the reload keeps its contents
+    let old_import_map = resolver.maybe_import_map().unwrap();
+
+    resolver
+      .reload_import_map(
+        &workspace_dir.workspace,
+        Some(specified("./b.ts")),
+        None,
+      )
+      .unwrap();
+    assert_eq!(resolve_alias(&resolver), root.join("b.ts").unwrap());
+    assert_eq!(
+      old_import_map.resolve("alias", &referrer).unwrap(),
+      root.join("a.ts").unwrap()
+    );
+    let serialized = resolver.to_serializable(&root);
+    let serialized_import_map = serialized.import_map.unwrap();
+    assert_eq!(serialized_import_map.specifier, "");
+    assert_eq!(
+      serde_json::from_str::<serde_json::Value>(&serialized_import_map.json)
+        .unwrap(),
+      json!({ "imports": { "alias": "./b.ts" } })
+    );
+
+    // removing the specified import map falls back to the workspace's own
+    // (empty) import map
+    resolver
+      .reload_import_map(&workspace_dir.workspace, None, None)
+      .unwrap();
+    assert!(resolver.maybe_import_map().is_none());
+    assert!(matches!(
+      resolver.resolve("alias", &referrer, ResolutionKind::Execution),
+      Err(MappedResolutionError::Specifier(_))
+    ));
+  }
+
+  #[test]
+  fn reload_import_map_uses_fresh_root_deno_json() {
+    let sys = InMemorySys::default();
+    let deno_json_path = root_dir().join("deno.json");
+    sys.fs_insert_json(
+      &deno_json_path,
+      json!({ "imports": { "alias": "./a.ts" } }),
+    );
+    let workspace_dir = workspace_at_start_dir(&sys, &root_dir());
+    let root = url_from_directory_path(&root_dir()).unwrap();
+    let resolver = WorkspaceResolver::from_workspace(
+      &workspace_dir.workspace,
+      sys.clone(),
+      super::CreateResolverOptions {
+        pkg_json_dep_resolution: PackageJsonDepResolution::Enabled,
+        specified_import_map: None,
+        sloppy_imports_options: SloppyImportsOptions::Unspecified,
+        fs_cache_options: FsCacheOptions::Enabled,
+      },
+    )
+    .unwrap();
+    let referrer = root.join("main.ts").unwrap();
+    let resolve_alias =
+      |resolver: &WorkspaceResolver<InMemorySys>| match resolver
+        .resolve("alias", &referrer, ResolutionKind::Execution)
+        .unwrap()
+      {
+        MappedResolution::Normal { specifier, .. } => specifier,
+        _ => unreachable!(),
+      };
+    assert_eq!(resolve_alias(&resolver), root.join("a.ts").unwrap());
+
+    // deno.json changes on disk after the workspace was discovered
+    sys.fs_insert_json(
+      &deno_json_path,
+      json!({ "imports": { "alias": "./b.ts" } }),
+    );
+    // without a fresh config the workspace's cached copy is still used
+    resolver
+      .reload_import_map(&workspace_dir.workspace, None, None)
+      .unwrap();
+    assert_eq!(resolve_alias(&resolver), root.join("a.ts").unwrap());
+    // with one, the inline imports from disk win
+    let fresh = new_rc(
+      deno_config::deno_json::ConfigFile::from_specifier(
+        &sys,
+        root.join("deno.json").unwrap(),
+      )
+      .unwrap(),
+    );
+    resolver
+      .reload_import_map(&workspace_dir.workspace, None, Some(fresh))
+      .unwrap();
+    assert_eq!(resolve_alias(&resolver), root.join("b.ts").unwrap());
+  }
+
+  #[test]
+  fn reload_import_map_error_keeps_previous() {
+    let sys = InMemorySys::default();
+    sys.fs_insert_json(root_dir().join("deno.json"), json!({}));
+    let workspace_dir = workspace_at_start_dir(&sys, &root_dir());
+    let root = url_from_directory_path(&root_dir()).unwrap();
+    let resolver = WorkspaceResolver::from_workspace(
+      &workspace_dir.workspace,
+      sys,
+      super::CreateResolverOptions {
+        pkg_json_dep_resolution: PackageJsonDepResolution::Enabled,
+        specified_import_map: Some(SpecifiedImportMap {
+          base_url: root.clone(),
+          value: json!({ "imports": { "alias": "./a.ts" } }),
+        }),
+        sloppy_imports_options: SloppyImportsOptions::Unspecified,
+        fs_cache_options: FsCacheOptions::Enabled,
+      },
+    )
+    .unwrap();
+    let err = resolver
+      .reload_import_map(
+        &workspace_dir.workspace,
+        Some(SpecifiedImportMap {
+          base_url: root.clone(),
+          // a scope value that is not an object is a hard parse error
+          value: json!({ "scopes": { "./sub/": "not an object" } }),
+        }),
+        None,
+      )
+      .unwrap_err();
+    assert!(
+      matches!(err, WorkspaceResolverCreateError::ImportMap(_)),
+      "{err:?}"
+    );
+    let referrer = root.join("main.ts").unwrap();
+    match resolver
+      .resolve("alias", &referrer, ResolutionKind::Execution)
+      .unwrap()
+    {
+      MappedResolution::Normal { specifier, .. } => {
+        assert_eq!(specifier, root.join("a.ts").unwrap());
       }
       _ => unreachable!(),
     }

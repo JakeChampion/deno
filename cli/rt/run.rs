@@ -1211,6 +1211,8 @@ impl StandaloneModuleLoaderFactory {
       module_loader: loader.clone(),
       node_require_loader: loader,
       hook_registry: Some(hook_registry),
+      // the import map is baked into the binary
+      import_map_reloader: None,
     }
   }
 }

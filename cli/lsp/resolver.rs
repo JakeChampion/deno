@@ -838,7 +838,8 @@ impl ConfiguredDepResolutions {
           }
         }
       };
-    if let Some(import_map) = workspace_resolver.maybe_import_map() {
+    let maybe_import_map = workspace_resolver.maybe_import_map();
+    if let Some(import_map) = &maybe_import_map {
       let referrer = import_map.base_url();
       for entry in import_map.imports().entries().chain(
         import_map

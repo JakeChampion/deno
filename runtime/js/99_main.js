@@ -20,6 +20,7 @@ import {
   op_ppid,
   op_proto_get_attempted,
   op_proto_set_attempted,
+  op_reload_import_map,
   op_set_format_exception_callback,
   op_snapshot_options,
   op_worker_close,
@@ -779,6 +780,14 @@ const userVisibleCore = ObjectFreeze(ObjectDefineProperties(
   userVisibleCoreDescriptors,
 ));
 ObjectAssign(internals, { core: userVisibleCore });
+// Re-reads the import map from its sources (the `--import-map` file and the
+// root deno.json's `imports`/`scopes`/`importMap`), re-reads the vendor
+// directory's manifest.json when vendoring is enabled, and resets this
+// isolate's cached resolutions so later dynamic imports and
+// `import.meta.resolve()` use the new state. Modules that are already
+// instantiated keep their existing imports. Internal API for embedders, not a
+// supported public API.
+internals.reloadImportMap = () => op_reload_import_map();
 const internalSymbol = Symbol("Deno.internal");
 // `Deno.test` and its sub-methods are no-ops outside of `deno test`, kept for
 // compatibility so they don't error under `deno run`. Mirrors the surface of

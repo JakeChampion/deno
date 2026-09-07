@@ -6,12 +6,39 @@ use deno_core::op2;
 
 deno_core::extension!(
   deno_runtime,
-  ops = [op_main_module, op_ppid, op_internal_log],
+  ops = [op_main_module, op_ppid, op_internal_log, op_reload_import_map],
   options = { main_module: ModuleSpecifier },
   state = |state, options| {
     state.put::<ModuleSpecifier>(options.main_module);
   },
 );
+
+/// Re-reads the import map from its source and invalidates the calling
+/// isolate's cached module resolutions. Backs
+/// `Deno[Deno.internal].reloadImportMap()`.
+///
+/// Embedders that support this put an `Rc<dyn ImportMapReloader>` into the
+/// worker's `OpState`; when none is present the op fails with a clear error.
+#[async_trait::async_trait(?Send)]
+pub trait ImportMapReloader {
+  async fn reload(&self) -> Result<(), deno_error::JsErrorBox>;
+}
+
+#[op2]
+async fn op_reload_import_map(
+  state: std::rc::Rc<std::cell::RefCell<OpState>>,
+) -> Result<(), deno_error::JsErrorBox> {
+  let reloader = state
+    .borrow()
+    .try_borrow::<std::rc::Rc<dyn ImportMapReloader>>()
+    .cloned();
+  let Some(reloader) = reloader else {
+    return Err(deno_error::JsErrorBox::generic(
+      "Reloading the import map is not supported in this runtime.",
+    ));
+  };
+  reloader.reload().await
+}
 
 #[op2]
 #[string]

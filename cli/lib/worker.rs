@@ -65,6 +65,11 @@ pub struct CreateModuleLoaderResult {
   pub node_require_loader: Rc<dyn NodeRequireLoader>,
   pub hook_registry:
     Option<deno_runtime::deno_node::ops::module_hooks::LoaderHookRegistry>,
+  /// Backs `Deno[Deno.internal].reloadImportMap()` for this isolate. `None`
+  /// when the runtime does not support reloading the import map (for example
+  /// `deno compile` output, where the import map is baked into the binary).
+  pub import_map_reloader:
+    Option<Rc<dyn deno_runtime::ops::runtime::ImportMapReloader>>,
 }
 
 pub trait ModuleLoaderFactory: Send + Sync {
@@ -368,6 +373,7 @@ impl<TSys: DenoLibSys> LibWorkerFactorySharedState<TSys> {
         module_loader,
         node_require_loader,
         hook_registry,
+        import_map_reloader,
       } = shared.module_loader_factory.create_for_worker(
         args.parent_permissions.clone(),
         args.permissions.clone(),
@@ -556,6 +562,9 @@ impl<TSys: DenoLibSys> LibWorkerFactorySharedState<TSys> {
       if let Some(registry) = hook_registry {
         worker.js_runtime.op_state().borrow_mut().put(registry);
       }
+      if let Some(reloader) = import_map_reloader {
+        worker.js_runtime.op_state().borrow_mut().put(reloader);
+      }
 
       // When resource limits are set, install a near-heap-limit callback
       // that terminates the worker's isolate gracefully instead of
@@ -667,6 +676,7 @@ impl<TSys: DenoLibSys> LibMainWorkerFactory<TSys> {
       module_loader,
       node_require_loader,
       hook_registry,
+      import_map_reloader,
     } = shared
       .module_loader_factory
       .create_for_main(permissions.clone());
@@ -789,6 +799,9 @@ impl<TSys: DenoLibSys> LibMainWorkerFactory<TSys> {
     // Wire module hook registry into OpState so JS ops share it with the loader
     if let Some(registry) = hook_registry {
       worker.js_runtime.op_state().borrow_mut().put(registry);
+    }
+    if let Some(reloader) = import_map_reloader {
+      worker.js_runtime.op_state().borrow_mut().put(reloader);
     }
 
     // Store the main inspector session sender for worker debugging

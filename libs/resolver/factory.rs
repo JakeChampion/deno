@@ -194,6 +194,15 @@ pub trait SpecifiedImportMapProvider:
   async fn get(
     &self,
   ) -> Result<Option<crate::workspace::SpecifiedImportMap>, anyhow::Error>;
+
+  /// Like `get`, but bypasses any caching so the result reflects the current
+  /// contents of the import map's source. Used when reloading the import map
+  /// at runtime. Defaults to `get`.
+  async fn get_fresh(
+    &self,
+  ) -> Result<Option<crate::workspace::SpecifiedImportMap>, anyhow::Error> {
+    self.get().await
+  }
 }
 
 #[derive(Debug)]
@@ -1263,6 +1272,57 @@ impl<TSys: WorkspaceFactorySys> ResolverFactory<TSys> {
     &self.workspace_factory
   }
 
+  /// Re-reads the import map from its sources and rebuilds the workspace
+  /// resolver's import map in place, so every holder of the resolver sees the
+  /// new map. The sources are the `--import-map` flag's file (if any) and the
+  /// root deno.json, which is re-read from disk so changes to its inline
+  /// `imports`/`scopes` or its `importMap` file are picked up.
+  ///
+  /// The workspace itself is not re-discovered: other deno.json settings,
+  /// workspace members and package.json files stay as they were at startup.
+  /// Resolutions already cached by callers (module graphs, instantiated
+  /// modules) are unaffected.
+  pub async fn reload_import_map(&self) -> Result<(), anyhow::Error> {
+    let Some(workspace_resolver) = self.workspace_resolver.get() else {
+      anyhow::bail!(
+        "Cannot reload the import map before the workspace resolver has been created."
+      );
+    };
+    let directory = self.workspace_factory.workspace_directory()?;
+    let specified_import_map = match &self.options.specified_import_map {
+      Some(provider) => provider.get_fresh().await?,
+      None => None,
+    };
+    let fresh_root_deno_json = match directory.workspace.root_deno_json() {
+      Some(root_deno_json) => {
+        Some(new_rc(deno_config::deno_json::ConfigFile::from_specifier(
+          self.workspace_factory.sys(),
+          root_deno_json.specifier.clone(),
+        )?))
+      }
+      None => None,
+    };
+    workspace_resolver.reload_import_map(
+      &directory.workspace,
+      specified_import_map,
+      fresh_root_deno_json,
+    )?;
+    // The vendor directory's manifest.json is also only read at startup;
+    // re-read it so vendored remote modules that changed on disk since then
+    // (e.g. a vendor directory swapped in before this call) load correctly.
+    if let GlobalOrLocalHttpCache::Local(local_cache) =
+      self.workspace_factory.http_cache()?
+    {
+      local_cache.reload_manifest();
+    }
+    // mirror what the LSP does after a config change so stale file system
+    // probes do not defeat mappings to newly written files
+    node_resolver::PackageJsonThreadLocalCache::clear();
+    node_resolver::cache::NodeResolutionThreadLocalCache::clear();
+    log_workspace_resolver_diagnostics(workspace_resolver);
+    Ok(())
+  }
+
   pub async fn workspace_resolver(
     &self,
   ) -> Result<&WorkspaceResolverRc<TSys>, anyhow::Error> {
@@ -1312,19 +1372,7 @@ impl<TSys: WorkspaceFactorySys> ResolverFactory<TSys> {
           resolver.set_compiler_options_resolver(
             self.compiler_options_resolver()?.clone(),
           );
-          if !resolver.diagnostics().is_empty() {
-            // todo(dsherret): do not log this in this crate... that should be
-            // a CLI responsibility
-            log::warn!(
-              "Resolver diagnostics:\n{}",
-              resolver
-                .diagnostics()
-                .iter()
-                .map(|d| format!("  - {d}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-            );
-          }
+          log_workspace_resolver_diagnostics(&resolver);
           Ok(new_rc(resolver))
         }
         // boxed to prevent the futures getting big and exploding the stack
@@ -1417,6 +1465,26 @@ pub fn npm_overrides_from_workspace(
       );
       NpmOverrides::default()
     }
+  }
+}
+
+fn log_workspace_resolver_diagnostics<
+  TSys: sys_traits::FsMetadata + sys_traits::FsRead,
+>(
+  resolver: &WorkspaceResolver<TSys>,
+) {
+  let diagnostics = resolver.diagnostics();
+  if !diagnostics.is_empty() {
+    // todo(dsherret): do not log this in this crate... that should be
+    // a CLI responsibility
+    log::warn!(
+      "Resolver diagnostics:\n{}",
+      diagnostics
+        .iter()
+        .map(|d| format!("  - {d}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+    );
   }
 }
 

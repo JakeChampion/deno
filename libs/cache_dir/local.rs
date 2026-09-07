@@ -259,6 +259,15 @@ impl<TSys: LocalHttpCacheSys> LocalHttpCache<TSys> {
     }
   }
 
+  /// Re-reads `manifest.json` from disk. The manifest is loaded once at
+  /// construction, so without this a vendor directory whose contents changed
+  /// after the cache was created is not seen. Entries that depend on the
+  /// manifest (content-type overrides, redirects, hashed file names) would
+  /// then fail to load even though the files exist.
+  pub fn reload_manifest(&self) {
+    self.manifest.reload();
+  }
+
   #[inline]
   fn env(&self) -> &TSys {
     &self.global_cache.sys
@@ -762,6 +771,7 @@ struct LocalCacheManifest<
 > {
   sys: Sys,
   file_path: PathBuf,
+  use_reverse_mapping: bool,
   data: RwLock<manifest::LocalCacheManifestData>,
 }
 
@@ -799,12 +809,32 @@ impl<
       .and_then(|bytes| String::from_utf8(bytes.into_owned()).ok());
     Self {
       sys,
+      use_reverse_mapping,
       data: RwLock::new(manifest::LocalCacheManifestData::new(
         text.as_deref(),
         use_reverse_mapping,
       )),
       file_path,
     }
+  }
+
+  /// Re-reads the manifest file from disk, replacing the in-memory copy.
+  ///
+  /// The manifest is otherwise only read at construction time. Embedders that
+  /// swap the vendor directory's contents at runtime use this to pick up the
+  /// new manifest. Entries added through `insert_data` are not lost by the
+  /// replacement in practice, because `insert_data` persists to the file on
+  /// every insert.
+  pub fn reload(&self) {
+    let text = self
+      .sys
+      .fs_read(&self.file_path)
+      .ok()
+      .and_then(|bytes| String::from_utf8(bytes.into_owned()).ok());
+    *self.data.write() = manifest::LocalCacheManifestData::new(
+      text.as_deref(),
+      self.use_reverse_mapping,
+    );
   }
 
   pub fn insert_data(
@@ -1133,6 +1163,35 @@ mod test {
         _temp: temp,
       }
     }
+  }
+
+  #[test]
+  fn test_reload_manifest() {
+    let caches = TestCaches::new();
+    // a second cache over the same directory, created while the manifest is
+    // still empty; Disallow so nothing is satisfied from the global cache
+    let stale_cache = new_rc(LocalHttpCache::new(
+      caches.local_temp.clone(),
+      caches.global_cache.clone(),
+      GlobalToLocalCopy::Disallow,
+      Url::parse("https://jsr.io/").unwrap(),
+    ));
+    // the content type contradicts the extension, so the local file lives at
+    // a hashed path that is only discoverable through the manifest
+    let url = Url::parse("https://deno.land/x/mod.ts").unwrap();
+    let headers = HashMap::from([(
+      "content-type".to_string(),
+      "application/javascript".to_string(),
+    )]);
+    caches.local_cache.set(&url, headers, b"export {}").unwrap();
+
+    let key = stale_cache.cache_item_key(&url).unwrap();
+    // not visible: the manifest was read before the entry was written
+    assert!(stale_cache.get(&key, None).unwrap().is_none());
+
+    stale_cache.reload_manifest();
+    let entry = stale_cache.get(&key, None).unwrap().unwrap();
+    assert_eq!(entry.content.as_ref(), b"export {}");
   }
 
   #[test]

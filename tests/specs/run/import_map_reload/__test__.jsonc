@@ -1,0 +1,44 @@
+{
+  "tempDir": true,
+  "tests": {
+    "flag_file_rewritten": {
+      "args": "run --allow-read --allow-write --import-map=map.json main.ts",
+      "output": "main.out"
+    },
+    "invalid_map_keeps_old": {
+      "args": "run --allow-write --import-map=map.json invalid.ts",
+      "output": "invalid.out"
+    },
+    "deno_json_import_map_path": {
+      "cwd": "deno_json",
+      "args": "run --allow-read --allow-write main.ts",
+      "output": "main.out"
+    },
+    "deno_json_inline_imports": {
+      "cwd": "deno_json_inline",
+      "args": "run --allow-read --allow-write --config=deno.json main.ts",
+      "output": "main.out"
+    },
+    "vendor_manifest": {
+      "steps": [
+        {
+          "cwd": "vendor_manifest/staging",
+          "envs": {
+            "DENO_DIR": "./deno_dir"
+          },
+          "args": "cache --vendor --allow-import=localhost:4545,localhost:4546 http://localhost:4546/welcome.ts",
+          "output": "[WILDCARD]"
+        },
+        {
+          "cwd": "vendor_manifest",
+          "args": "run --vendor --cached-only --allow-import=localhost:4545,localhost:4546 --allow-read --allow-write --config=deno.json main.ts",
+          "output": "vendor_manifest/main.out"
+        }
+      ]
+    },
+    "worker_scope": {
+      "args": "run -A --import-map=map.json workers.ts",
+      "output": "workers.out"
+    }
+  }
+}

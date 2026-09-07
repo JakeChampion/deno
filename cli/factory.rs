@@ -190,24 +190,44 @@ struct CliSpecifiedImportMapProvider {
     Arc<WorkspaceExternalImportMapLoader<CliSys>>,
 }
 
-#[async_trait::async_trait(?Send)]
-impl SpecifiedImportMapProvider for CliSpecifiedImportMapProvider {
-  async fn get(
+impl CliSpecifiedImportMapProvider {
+  /// Loads the specified import map. When `fresh` is set, caches are bypassed
+  /// (a remote `--import-map` is re-downloaded and a deno.json `importMap`
+  /// file is re-read) so the result reflects the current source.
+  async fn load(
     &self,
+    fresh: bool,
   ) -> Result<Option<deno_resolver::workspace::SpecifiedImportMap>, AnyError>
   {
     async fn resolve_import_map_value_from_specifier(
       specifier: &Url,
       file_fetcher: &CliFileFetcher,
+      fresh: bool,
     ) -> Result<serde_json::Value, AnyError> {
       if specifier.scheme() == "data" {
         let data_url_text =
           deno_media_type::data_url::RawDataUrl::parse(specifier)?.decode()?;
         Ok(serde_json::from_str(&data_url_text)?)
       } else {
-        let file = TextDecodedFile::decode(
-          file_fetcher.fetch_bypass_permissions(specifier).await?,
-        )?;
+        let file = if fresh {
+          file_fetcher
+            .fetch_with_options(
+              specifier,
+              deno_resolver::file_fetcher::FetchPermissionsOptionRef::AllowAll,
+              deno_resolver::file_fetcher::FetchOptions {
+                local: Default::default(),
+                maybe_auth: None,
+                maybe_accept: None,
+                maybe_cache_setting: Some(
+                  &deno_cache_dir::file_fetcher::CacheSetting::ReloadAll,
+                ),
+              },
+            )
+            .await?
+        } else {
+          file_fetcher.fetch_bypass_permissions(specifier).await?
+        };
+        let file = TextDecodedFile::decode(file)?;
         Ok(serde_json::from_str(&file.source)?)
       }
     }
@@ -221,6 +241,7 @@ impl SpecifiedImportMapProvider for CliSpecifiedImportMapProvider {
           None => resolve_import_map_value_from_specifier(
             &specifier,
             &self.file_fetcher,
+            fresh,
           )
           .await
           .with_context(|| {
@@ -233,19 +254,42 @@ impl SpecifiedImportMapProvider for CliSpecifiedImportMapProvider {
         }))
       }
       None => {
-        if let Some(import_map) =
-          self.workspace_external_import_map_loader.get_or_load()?
-        {
+        let maybe_import_map = if fresh {
+          self.workspace_external_import_map_loader.load_fresh()?
+        } else {
+          self
+            .workspace_external_import_map_loader
+            .get_or_load()?
+            .cloned()
+        };
+        if let Some(import_map) = maybe_import_map {
           let path_url = deno_path_util::url_from_file_path(&import_map.path)?;
           Ok(Some(deno_resolver::workspace::SpecifiedImportMap {
             base_url: path_url,
-            value: import_map.value.clone(),
+            value: import_map.value,
           }))
         } else {
           Ok(None)
         }
       }
     }
+  }
+}
+
+#[async_trait::async_trait(?Send)]
+impl SpecifiedImportMapProvider for CliSpecifiedImportMapProvider {
+  async fn get(
+    &self,
+  ) -> Result<Option<deno_resolver::workspace::SpecifiedImportMap>, AnyError>
+  {
+    self.load(false).await
+  }
+
+  async fn get_fresh(
+    &self,
+  ) -> Result<Option<deno_resolver::workspace::SpecifiedImportMap>, AnyError>
+  {
+    self.load(true).await
   }
 }
 
@@ -1274,6 +1318,7 @@ impl CliFactory {
       resolver_factory.parsed_source_cache().clone(),
       resolver_factory.module_loader()?.clone(),
       self.resolver().await?.clone(),
+      resolver_factory.clone(),
       self.sys(),
       maybe_eszip_loader,
       self.watcher_communicator.clone(),
